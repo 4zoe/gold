@@ -380,7 +380,11 @@ async function fetchLiveRates() {
         const apiResponse = await apiClient.getLiveRates();
         state.liveAPI = apiResponse.liveAPI;
 
-        document.getElementById("devOutput").textContent = JSON.stringify(apiResponse.source, null, 2);
+        const sourceMeta = apiResponse.spotMeta || {};
+        document.getElementById("devOutput").textContent = JSON.stringify({
+            spotMeta: sourceMeta,
+            sourcePayload: apiResponse.source
+        }, null, 2);
 
         SCRAP_DATA["E-Waste (Live Yield)"].items.forEach(i => { i.p = (i.goldYield||0)*state.liveAPI.gold_raw + (i.pdYield||0)*state.liveAPI.palladium_raw; });
         SCRAP_DATA["Catalytic Converters"].items.forEach(i => { i.p = (i.ptYield||0)*state.liveAPI.platinum_raw + (i.pdYield||0)*state.liveAPI.palladium_raw + (i.rhYield||0)*state.liveAPI.rhodium_raw; });

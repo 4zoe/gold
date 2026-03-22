@@ -7,6 +7,7 @@ const PORT = process.env.PORT || 3000;
 const OZ_TO_GRAM = 31.1035;
 const PURITIES = { "24K": 1.0, "22K": 0.9167, "20K": 0.8333, "18K": 0.75, "16K": 0.6667, "14K": 0.5833, "12K": 0.5, "10K": 0.4167 };
 const RHODIUM_FALLBACK = 145.0;
+const SPOT_TIMEOUT_MS = 6000;
 
 app.use(cors());
 app.use(express.json());
@@ -16,12 +17,92 @@ function cloneMaterials() {
 }
 
 async function getSpotFeed() {
+  const controllers = [];
+  const timeout = setTimeout(() => {
+    controllers.forEach((controller) => controller.abort());
+  }, SPOT_TIMEOUT_MS);
+
   let payload;
+  let sourceName = 'fallback-static';
+  let isFallback = false;
+
   try {
-    const response = await fetch('https://data-asg.goldprice.org/dbXRates/USD');
+    const goldPriceController = new AbortController();
+    controllers.push(goldPriceController);
+    const response = await fetch('https://data-asg.goldprice.org/dbXRates/USD', {
+      signal: goldPriceController.signal
+    });
     if (!response.ok) throw new Error(`Spot API failed: ${response.status}`);
     payload = await response.json();
+    sourceName = 'goldprice.org';
   } catch (_error) {
+    try {
+      const yahooController = new AbortController();
+      controllers.push(yahooController);
+      const response = await fetch('https://query1.finance.yahoo.com/v7/finance/quote?symbols=GC%3DF,SI%3DF,PL%3DF,PA%3DF', {
+        signal: yahooController.signal
+      });
+      if (!response.ok) throw new Error(`Yahoo quote API failed: ${response.status}`);
+      const yahooPayload = await response.json();
+      const results = yahooPayload?.quoteResponse?.result || [];
+      const bySymbol = new Map(results.map((row) => [row.symbol, row]));
+
+      const xauPrice = Number(bySymbol.get('GC=F')?.regularMarketPrice);
+      const xagPrice = Number(bySymbol.get('SI=F')?.regularMarketPrice);
+      const xptPrice = Number(bySymbol.get('PL=F')?.regularMarketPrice);
+      const xpdPrice = Number(bySymbol.get('PA=F')?.regularMarketPrice);
+
+      if (![xauPrice, xagPrice, xptPrice, xpdPrice].every(Number.isFinite)) {
+        throw new Error('Yahoo quote payload missing one or more required symbols');
+      }
+
+      payload = {
+        items: [{ xauPrice, xagPrice, xptPrice, xpdPrice }],
+        upstream: yahooPayload
+      };
+      sourceName = 'yahoo-finance-futures';
+    } catch (_secondError) {
+      isFallback = true;
+      sourceName = 'fallback-static';
+      payload = {
+        items: [
+          {
+            xauPrice: 2050,
+            xagPrice: 23.5,
+            xptPrice: 900,
+            xpdPrice: 1000
+          }
+        ],
+        fallback: true
+      };
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (sourceName === 'goldprice.org') {
+    const itemCheck = payload?.items?.[0];
+    if (!itemCheck || !Number.isFinite(Number(itemCheck.xauPrice)) || !Number.isFinite(Number(itemCheck.xagPrice))) {
+      isFallback = true;
+      sourceName = 'fallback-static';
+      payload = {
+        items: [
+          {
+            xauPrice: 2050,
+            xagPrice: 23.5,
+            xptPrice: 900,
+            xpdPrice: 1000
+          }
+        ],
+        fallback: true
+      };
+    }
+  }
+
+  const item = payload.items?.[0];
+  if (!item) {
+    isFallback = true;
+    sourceName = 'fallback-static';
     payload = {
       items: [
         {
@@ -34,9 +115,6 @@ async function getSpotFeed() {
       fallback: true
     };
   }
-
-  const item = payload.items?.[0];
-  if (!item) throw new Error('Spot API payload missing items[0]');
 
   const goldG = item.xauPrice / OZ_TO_GRAM;
   const silverG = item.xagPrice / OZ_TO_GRAM;
@@ -65,7 +143,15 @@ async function getSpotFeed() {
     rhodium_raw: RHODIUM_FALLBACK
   };
 
-  return { payload, liveAPI };
+  return {
+    payload,
+    liveAPI,
+    meta: {
+      source: sourceName,
+      fallback: isFallback,
+      fetchedAt: new Date().toISOString()
+    }
+  };
 }
 
 function applyDynamicRates(materials, liveAPI) {
@@ -105,7 +191,7 @@ function getRate(item, unit) {
 
 app.get('/prices/live', async (_req, res) => {
   try {
-    const { payload, liveAPI } = await getSpotFeed();
+    const { payload, liveAPI, meta } = await getSpotFeed();
     const materials = applyDynamicRates(cloneMaterials(), liveAPI);
 
     res.json({
@@ -115,6 +201,7 @@ app.get('/prices/live', async (_req, res) => {
         catalyticConverters: materials['Catalytic Converters'].items
       },
       source: payload,
+      spotMeta: meta,
       fetchedAt: new Date().toISOString()
     });
   } catch (error) {
